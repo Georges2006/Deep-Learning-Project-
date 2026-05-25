@@ -1,0 +1,133 @@
+import os
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+# ==============================================================================
+# CONFIGURATION & HYPERPARAMETERS
+# ==============================================================================
+CSV_PATH      = "./flickr30k/captions.txt"     # Path to your dataset text file
+BATCH_SIZE    = 32
+MAX_SEQ_LEN   = 40      # Max words allowed per caption (for truncation/padding)
+EMBEDDING_DIM = 300     # Dimension of word embedding vectors (e.g., GloVe 300d)
+HIDDEN_DIM    = 256     # Hidden size inside the GRU cells
+DEVICE        = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ==============================================================================
+# STEP 1: PREPROCESSING (TOKENIZATION & VOCABULARY BUILDING)
+# ==============================================================================
+def load_and_tokenize_captions(csv_path):
+    """Reads captions.txt and builds a vocabulary dictionary mapping words to IDs."""
+    # Load the verified dataset format
+    df = pd.read_csv(csv_path, sep=',', on_bad_lines='skip')
+    df.columns = [col.strip() for col in df.columns]
+    df['comment'] = df['comment'].astype(str).str.lower()
+
+    # Extract only the first caption per image to keep a 1-to-1 relationship
+    img_to_caption = df.groupby('image_name')['comment'].first().to_dict()
+
+    # Build a token vocabulary list
+    all_words = " ".join(list(img_to_caption.values())).split()
+    vocab = {"<PAD>": 0, "<UNK>": 1}  # 0 for padding empty spaces, 1 for unknown words
+
+    for word in set(all_words):
+        if len(vocab) < 10000:  # Cap the vocabulary size at a stable 10,000 words
+            vocab[word] = len(vocab)
+
+    return img_to_caption, vocab
+
+print("Executing Step 1: Preprocessing and tokenizing textual descriptions...")
+IMG_CAPTION_MAP, VOCABULARY = load_and_tokenize_captions(CSV_PATH)
+VOCAB_SIZE = len(VOCABULARY)
+
+def text_to_token_tensor(text, vocab, max_len):
+    """Converts a raw sentence string into a padded/truncated tensor of integer IDs."""
+    words = text.split()
+    indices = [vocab.get(w, vocab["<UNK>"]) for w in words]
+
+    # Pad sequence if it's too short, truncate if it's too long
+    if len(indices) < max_len:
+        indices += [vocab["<PAD>"]] * (max_len - len(indices))
+    else:
+        indices = indices[:max_len]
+
+    return torch.tensor(indices, dtype=torch.long)
+
+# Simple Text-Only Dataset Helper
+class Flickr30kTextDataset(Dataset):
+    def __init__(self, img_to_caption, vocab):
+        self.image_names = sorted(list(img_to_caption.keys()))
+        self.img_to_caption = img_to_caption
+        self.vocab = vocab
+
+    def __len__(self):
+        return len(self.image_names)
+
+    def __getitem__(self, idx):
+        img_name = self.image_names[idx]
+        raw_caption = self.img_to_caption[img_name]
+        token_tensor = text_to_token_tensor(raw_caption, self.vocab, MAX_SEQ_LEN)
+        return token_tensor
+
+text_dataset = Flickr30kTextDataset(IMG_CAPTION_MAP, VOCABULARY)
+text_loader = DataLoader(text_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+# ==============================================================================
+# STEP 2 & 3: RNN MODEL & SEQUENCE ENCODING DEFINITION
+# ==============================================================================
+class StandaloneTextProcessor(nn.Module):
+    def __init__(self, vocab_size, embedding_dim, hidden_dim):
+        super(StandaloneTextProcessor, self).__init__()
+
+        # Converts word IDs into dense 300-dimensional continuous embedding vectors
+        self.embedding_layer = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
+
+        # Bidirectional GRU captures sequential and contextual dependencies from both directions
+        self.rnn_model = nn.GRU(
+            input_size=embedding_dim,
+            hidden_size=hidden_dim,
+            num_layers=2,
+            batch_first=True,
+            bidirectional=True,
+            dropout=0.3
+        )
+
+    def forward(self, text_tokens):
+        # ─── STEP 2: PASS EMBEDDING VECTORS THROUGH THE RNN ───
+        # Input shape: (batch_size, max_seq_len) -> e.g., (32, 40)
+        embedded_vectors = self.embedding_layer(text_tokens)
+        # Shape after embedding: (batch_size, max_seq_len, embedding_dim) -> (32, 40, 300)
+
+        # Run the embedding tensors through the GRU sequence layer
+        # output shape: (batch, seq_len, hidden_dim * directions)
+        # hidden_states shape: (num_layers * directions, batch, hidden_dim)
+        output, hidden_states = self.rnn_model(embedded_vectors)
+
+        # ─── STEP 3: SEQUENCE ENCODING FROM THE FINAL RNN LAYER ───
+        # Extract the final hidden state of the top layer for both forward and backward runs
+        forward_final = hidden_states[-2, :, :]   # Shape: (batch_size, hidden_dim)
+        backward_final = hidden_states[-1, :, :]  # Shape: (batch_size, hidden_dim)
+
+        # Glue them together to represent the definitive encoding vector associated with each image
+        sequence_encoding = torch.cat((forward_final, backward_final), dim=1)
+        # Final Output Shape: (batch_size, hidden_dim * 2) -> (32, 512)
+
+        return sequence_encoding
+
+# ==============================================================================
+# PIPELINE SANITY TEST RUN
+# ==============================================================================
+print("\nInstantiating the Text Processor Module...")
+text_encoder = StandaloneTextProcessor(VOCAB_SIZE, EMBEDDING_DIM, HIDDEN_DIM).to(DEVICE)
+text_encoder.eval()
+
+# Grab one actual batch from your dataloader to test it out
+sample_batch = next(iter(text_loader)).to(DEVICE)
+
+with torch.no_grad():
+    final_sequence_encodings = text_encoder(sample_batch)
+
+print("\nExecution Successful!")
+print(f"-> Input batch shape fed into RNN: {sample_batch.shape}")
+print(f"-> Final Sequence Encoding shape produced (Ready for Image fusion): {final_sequence_encodings.shape}")
